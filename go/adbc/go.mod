@@ -17,7 +17,7 @@
 
 module github.com/apache/arrow-adbc/go/adbc
 
-go 1.25.0
+go 1.26.10
 
 require (
 	cloud.google.com/go/bigquery v1.72.0
@@ -70,7 +70,7 @@ require (
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )
 
-replace github.com/snowflakedb/gosnowflake => github.com/dbt-labs/gosnowflake v1.17.11
+replace github.com/snowflakedb/gosnowflake => github.com/dbt-labs/gosnowflake v1.17.13
 
 replace github.com/databricks/databricks-sql-go => github.com/dbt-labs/databricks-sql-go v1.14.2
 

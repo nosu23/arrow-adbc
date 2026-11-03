@@ -19,15 +19,22 @@ package bigquery
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/bigquery"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"golang.org/x/oauth2/google/externalaccount"
 	"google.golang.org/api/option"
 )
@@ -570,5 +577,130 @@ func TestStatementSetGetOptionReservation(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("expected empty after clear, got %q", got)
+	}
+}
+
+// TestImpersonationUsesConfiguredAuthAsSource checks that the IAM
+// generateAccessToken call is made with the credentials selected by the auth
+// type, not Application Default Credentials.
+func TestImpersonationUsesConfiguredAuthAsSource(t *testing.T) {
+	var gotAuth atomic.Value
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accessToken":"impersonated","expireTime":"2099-01-01T00:00:00Z"}`))
+	}))
+	defer srv.Close()
+
+	// The IAM endpoint is hard-coded in the SDK, so route every dial to srv.
+	orig := http.DefaultTransport
+	http.DefaultTransport = &http.Transport{
+		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&tls.Dialer{Config: &tls.Config{InsecureSkipVerify: true}}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+	}
+	defer func() { http.DefaultTransport = orig }()
+
+	conn := &connectionImpl{
+		authType:                   OptionValueAuthTypeTemporaryAccessToken,
+		accessToken:                "user-token",
+		impersonateTargetPrincipal: "sa@p.iam.gserviceaccount.com",
+		impersonateScopes:          []string{"https://www.googleapis.com/auth/bigquery"},
+		impersonateLifetime:        time.Hour, // non-zero lifetime fetches the token eagerly
+	}
+	if _, err := conn.authOptions(context.Background()); err != nil {
+		t.Fatalf("authOptions returned error: %v", err)
+	}
+	if got, _ := gotAuth.Load().(string); got != "Bearer user-token" {
+		t.Fatalf("expected generateAccessToken to be called with the user's token, got Authorization %q", got)
+	}
+}
+
+func TestStatementGetDatasetMetadata(t *testing.T) {
+	var requestPath string
+	var datasetView string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		datasetView = r.URL.Query().Get("datasetView")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"datasetReference": {
+				"projectId": "test-project",
+				"datasetId": "test_dataset"
+			},
+			"friendlyName": "Marts",
+			"location": "US",
+			"description": "Dataset for marts",
+			"labels": {"team": "analytics"},
+			"tags": [{"tagKey": "12345/environment", "tagValue": "production"}],
+			"access": [{"role": "OWNER", "userByEmail": "owner@example.com"}]
+		}`))
+	}))
+	defer srv.Close()
+
+	client, err := bigquery.NewClient(
+		context.Background(),
+		"connection-project",
+		option.WithEndpoint(srv.URL+"/"+bigQueryRESTPath),
+		option.WithHTTPClient(srv.Client()),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatalf("bigquery.NewClient returned error: %v", err)
+	}
+	defer client.Close()
+
+	cnxn := &connectionImpl{
+		ConnectionImplBase: driverbase.ConnectionImplBase{Alloc: memory.DefaultAllocator},
+		client:             client,
+	}
+	st := &statement{alloc: memory.DefaultAllocator, cnxn: cnxn}
+	if err := st.SetOption(
+		OptionJsonGetDatasetMetadata,
+		`{"project":"test-project","dataset":"test_dataset"}`,
+	); err != nil {
+		t.Fatalf("SetOption returned error: %v", err)
+	}
+
+	rdr, rows, err := st.ExecuteQuery(context.Background())
+	if err != nil {
+		t.Fatalf("ExecuteQuery returned error: %v", err)
+	}
+	defer rdr.Release()
+
+	if requestPath != "/bigquery/v2/projects/test-project/datasets/test_dataset" {
+		t.Fatalf("unexpected request path %q", requestPath)
+	}
+	if datasetView != string(bigquery.DatasetMetadataView) {
+		t.Fatalf("expected datasetView %q, got %q", bigquery.DatasetMetadataView, datasetView)
+	}
+	if rows != 1 {
+		t.Fatalf("expected one row, got %d", rows)
+	}
+	if !rdr.Next() {
+		t.Fatalf("expected one record batch: %v", rdr.Err())
+	}
+	encoded := rdr.RecordBatch().Column(0).(*array.String).Value(0)
+	var result map[string]any
+	if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+		t.Fatalf("invalid metadata JSON: %v", err)
+	}
+	if len(result) != 3 {
+		t.Fatalf("expected three metadata fields, got %v", result)
+	}
+	if got := result["name"]; got != "Marts" {
+		t.Fatalf("unexpected name: %v", got)
+	}
+	if got := result["location"]; got != "US" {
+		t.Fatalf("expected location US, got %v", got)
+	}
+	if got := result["description"]; got != "Dataset for marts" {
+		t.Fatalf("unexpected description: %v", got)
+	}
+	if _, found := result["access"]; found {
+		t.Fatal("METADATA view must not expose access entries")
+	}
+	if rdr.Next() {
+		t.Fatal("expected only one record batch")
 	}
 }

@@ -47,6 +47,9 @@ const (
 	DEFAULT_RETRY_WAIT_MAX = 30 * time.Second
 )
 
+// 0 is a valid retry count (retries off), so "unset" has to be a negative value.
+const unsetQueryRetryCount = -1
+
 type databaseImpl struct {
 	driverbase.DatabaseImplBase
 
@@ -93,6 +96,10 @@ type databaseImpl struct {
 	azureClientID     string
 	azureClientSecret string
 	azureTenantID     string
+
+	// OIDC auth
+	oidcClientID      string
+	oidcTokenFilepath string
 
 	// Session parameters passed to the Databricks SQL session at connection time.
 	// Keys are parameter names (e.g. "QUERY_TAGS"), values are parameter values.
@@ -190,6 +197,18 @@ func (d *databaseImpl) resolveConnectionOptions() ([]dbsql.ConnOption, error) {
 			return nil, err
 		}
 		opts = append(opts, dbsql.WithAuthenticator(authenticator))
+	case OptionValueAuthTypeEnvOIDC, OptionValueAuthTypeFileOIDC:
+		if d.oidcClientID == "" {
+			return nil, adbc.Error{
+				Code: adbc.StatusInvalidArgument,
+				Msg:  fmt.Sprintf("client ID is required when using auth type '%s'. Set this via '%s'.", d.authType, OptionOIDCClientID),
+			}
+		}
+		authenticator, err := d.newOIDCAuthenticator(d.authType)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, dbsql.WithAuthenticator(authenticator))
 	default:
 		return nil, adbc.Error{
 			Code: adbc.StatusInvalidArgument,
@@ -277,15 +296,47 @@ func (d *databaseImpl) initializeConnectionPool(ctx context.Context) (*sql.DB, e
 	db := sql.OpenDB(connector)
 
 	// Test the connection
-	if err := db.PingContext(ctx); err != nil {
+	if err := d.pingPool(ctx, db); err != nil {
 		err = errors.Join(err, db.Close())
-		return nil, adbc.Error{
-			Code: adbc.StatusInternal,
-			Msg:  fmt.Sprintf("failed to ping database: %v", err),
-		}
+		return nil, errorWithSQLState(adbc.StatusInternal, "failed to ping database", err)
 	}
 
 	return db, nil
+}
+
+// pingPool verifies the pool can open a session and run a trivial query.
+//
+// databricks-sql-go's own Ping runs "select 1" under a fixed 60s deadline
+// (Config.PingTimeout) that connect_timeout does not affect. Against a
+// cold-starting warehouse the session opens but the query waits for the warehouse
+// to come up, so the ping fails with "context deadline exceeded" no matter how
+// large connect_timeout is. Instead, run the same query ourselves and give the
+// whole sequence (session open + query) the connect_timeout budget, so a
+// cold-starting warehouse has until that deadline to come up.
+//
+// Without a connect timeout this keeps the SDK's Ping behavior.
+func (d *databaseImpl) pingPool(ctx context.Context, db *sql.DB) error {
+	if !d.hasConnectTimeout() {
+		return db.PingContext(ctx)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, d.connectTimeout)
+	defer cancel()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	rows, err := conn.QueryContext(ctx, "select 1")
+	if err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	return rows.Err()
 }
 
 func (d *databaseImpl) getOrCreatePool(ctx context.Context) (*sql.DB, error) {
@@ -451,6 +502,40 @@ func (d *databaseImpl) newAzureClientSecretAuthenticator() (*sdkconfig.Config, e
 	return cfg, nil
 }
 
+// newOIDCAuthenticator builds a databricks-sdk-go Config for OIDC token federation.
+// authType selects where the SDK reads the OIDC token from: an environment variable
+// (env-oidc) or a file (file-oidc).
+func (d *databaseImpl) newOIDCAuthenticator(authType string) (*sdkconfig.Config, error) {
+	cfg := &sdkconfig.Config{
+		Host:     "https://" + d.serverHostname,
+		ClientID: d.oidcClientID,
+		AuthType: authType,
+	}
+	switch authType {
+	case OptionValueAuthTypeEnvOIDC:
+		cfg.Credentials = sdkconfig.EnvOIDCCredentials{}
+	case OptionValueAuthTypeFileOIDC:
+		cfg.Credentials = sdkconfig.FileOIDCCredentials{}
+		// The Databricks SDK allows the OIDC file path to be provided in an environment variable
+		// DATABRICKS_OIDC_TOKEN_FILEPATH or DATABRICKS_OIDC_TOKEN_FILE instead of as an option.
+		if d.oidcTokenFilepath != "" {
+			cfg.OIDCTokenFilepath = d.oidcTokenFilepath
+		}
+	default:
+		return nil, adbc.Error{
+			Code: adbc.StatusInvalidArgument,
+			Msg:  fmt.Sprintf("'%s' is not an OIDC auth type", authType),
+		}
+	}
+	if err := cfg.EnsureResolved(); err != nil {
+		return nil, adbc.Error{
+			Code: adbc.StatusInvalidArgument,
+			Msg:  fmt.Sprintf("failed to configure '%s' auth: %v", authType, err),
+		}
+	}
+	return cfg, nil
+}
+
 func (d *databaseImpl) SetOptions(options map[string]string) error {
 	for k, v := range options {
 		if err := d.SetOption(k, v); err != nil {
@@ -610,6 +695,10 @@ func (d *databaseImpl) SetOption(key, value string) error {
 		d.azureTenantID = value
 	case OptionOAuthRefreshToken:
 		d.oauthRefreshToken = value
+	case OptionOIDCClientID:
+		d.oidcClientID = value
+	case OptionOIDCTokenFilepath:
+		d.oidcTokenFilepath = value
 	case OptionExternalBrowserTimeout:
 		if value != "" {
 			timeout, err := time.ParseDuration(value)
